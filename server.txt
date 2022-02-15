@@ -1,0 +1,540 @@
+// nodejs在http模块实现websocket的例子
+import * as http from 'http'
+import * as url from 'url'
+import * as net from 'net'
+import * as querystring from 'querystring'
+import * as path from 'path'
+import * as fs from 'fs'
+
+
+export const contentTypes ={
+  'txt':'text/plain'
+  ,'html':'text/html'
+  ,'htm':'text/html'
+  ,'js':'text/javascript'
+  ,'png':'image/png'
+  ,'jpg':'image/jpg'  
+}
+
+const publicReadonlyDescriptor = {enumerable:true,writeable:false,configuratable:false,value:undefined}
+const privateReadonlyDescriptor = {enumerable:false,writeable:false,configuratable:false,value:undefined}
+const internalDescriptor = {enumerable:false,writeable:false,configuratable:true,value:undefined}
+
+
+const servRegx = /\/\.\-serv\-side\//g
+const jsonRegx = /(^\s*\{)|(^\s*\[)|(^\s*')|(^\s*")|(\s*\d+(\.\d+)?\s*$)/gi
+const trimRegx = /(^\s+)|(\s+$)/g
+
+export interface WebHandler{
+  before(ctx:WebContext):Promise<boolean>
+  after(ctx:WebContext):Promise<boolean>
+}
+
+
+/**
+ * 依赖注入类
+ *
+ * @class Injection
+ */
+class InjectScope{
+  private _injectors:{[name:string]:{():any}}
+  scopeName:string
+  scopeParent:InjectScope
+  constructor(name?:string,parent?:InjectScope,preInjectors?:{[name:string]:{():any}}){
+    internalDescriptor.value = parent
+    Object.defineProperty(this,'scopeParent',internalDescriptor)
+    publicReadonlyDescriptor.value = name
+    Object.defineProperty(this,'scopeName',publicReadonlyDescriptor)
+    if(preInjectors){
+      privateReadonlyDescriptor.value = {}
+      Object.defineProperty(this,'_injectors',privateReadonlyDescriptor)
+    }
+  }
+  resolve(name:string){
+    if(this._injectors){
+      const injector = this._injectors[name]
+      if(injector){
+        return injector()
+      }
+      return this.scopeParent?this.scopeParent.resolve(name):undefined
+    }
+    return this.scopeParent?this.scopeParent.resolve(name):undefined
+  }
+  register(name:string,value:any,isFactory?:boolean):InjectScope{
+    if(!this._injectors) {
+      privateReadonlyDescriptor.value = {}
+      Object.defineProperty(this,'_injectors',privateReadonlyDescriptor)
+    }
+    if(isFactory){
+      this._injectors[name] = value
+    }else this._injectors[name] = ()=>value
+    return this
+  }
+  createInstance(ctor:{new(...args):any}){
+    const argnames = InjectScope.argnames(ctor)
+    const args = []
+    for(let an of argnames){
+      args.push(this.resolve(an))
+    }
+    return InjectScope.createInstance(ctor,args)
+  }
+
+  static createInstance(ctor:{new(...args):any},args?:any[]){
+    // 创建一个空对象，继承构造函数的原型对象
+    let res = Object.create(ctor.prototype);
+      // 执行构造函数，传递上下文和参数
+    let ret;
+    if(!args || args.length===0) ret = ctor.call(res)
+    else if(args.length===1) ret = ctor.call(res,args.shift())
+    else ret = ctor.apply(res, args||[]);
+    if (typeof ret === 'object' && ret !== null) {
+      return ret
+    } else {
+      return res
+    }
+  }
+
+  
+
+  static argnames(fn:Function):string[]{
+    if((fn as any)['--argnames']) return (fn as any)['--argnames']
+    const code = fn.toString()
+    const begin = code.indexOf('(')
+    const end = code.indexOf(')',begin)
+    const argslist= code.substr(begin+1,end-begin)
+    let args = argslist.split(',')
+    for(let i =0,j=args.length;i<j;i++){
+      let arg = args.shift().replace(trimRegx,'')
+      args.push(arg)
+    }
+    privateReadonlyDescriptor.value = Object.freeze(args)
+    Object.defineProperty(fn,'--argnames',privateReadonlyDescriptor)
+    return args
+  }
+}
+export interface WebHostOptions{
+  port?:number
+  root?:string
+}
+
+export class WebHost extends InjectScope{
+  port:number
+  root:string
+  opts: WebHostOptions
+  private _http;
+  private _modules:{[name:string]:Module}
+  private _commands:{[path:string]:Command}
+  constructor(opts:WebHostOptions){
+    super('<Host>')
+    this.opts = opts
+    publicReadonlyDescriptor.value = opts.port || 80
+    Object.defineProperty(this,'port',publicReadonlyDescriptor)
+    publicReadonlyDescriptor.value = opts.root || __dirname
+    Object.defineProperty(this,'root',publicReadonlyDescriptor)
+    privateReadonlyDescriptor.value = {}
+    Object.defineProperty(this,'_modules',privateReadonlyDescriptor)
+    privateReadonlyDescriptor.value = {}
+    Object.defineProperty(this,'_commands',privateReadonlyDescriptor)
+    this.register("host_root",this.root)
+    .register('$host',this)
+  }
+  run(){
+    if(this._http) {
+      console.error("Already running.")
+      return
+    }
+    this._http = http.createServer((req:http.IncomingMessage, res:http.ServerResponse)=>{
+      this.handleRequest(req,res)
+    }).listen(this.port)
+    console.log(`listen at ${this.port}...`)
+    return this
+  }
+  public async handleRequest(req:http.IncomingMessage, res:http.ServerResponse):Promise<void>{
+    //创建Web请求上下文
+    const ctx = new WebContext(req,res,this)
+    if(ctx.method==='GET'){
+      await this.handleGET(ctx)
+    }else if(ctx.method==='POST' || ctx.method==='PUT'){
+      await this.handlePOST(ctx)
+    }
+  }
+  async handleGET(ctx:WebContext):Promise<void>{
+    const handled = await this.handleStatic(ctx)
+    if(handled===false){
+      // 指定上下文的commandLine
+      publicReadonlyDescriptor.value = ctx.uri.pathname
+      Object.defineProperty(ctx,"commandLine",publicReadonlyDescriptor)
+      // 开始处理命令
+      await this.handeCommand(ctx)
+    } 
+  }
+  async handlePOST(ctx:WebContext):Promise<void>{
+    const httpBody = await this._handleHttpBody(ctx)
+    publicReadonlyDescriptor.value = httpBody
+    Object.defineProperty(ctx,"req_body",publicReadonlyDescriptor)
+
+    // 指定上下文的commandLine
+    publicReadonlyDescriptor.value = ctx.uri.pathname
+    Object.defineProperty(ctx,"commandLine",publicReadonlyDescriptor)
+    //执行command
+    await this.handeCommand(ctx)
+  }
+  private handleError(ctx:WebContext,code,err){
+    ctx.res.writeHead(code)
+    ctx.res.end(err)
+    return this
+  }
+  private async handleStatic(ctx:WebContext):Promise<boolean>{
+    if(servRegx.test(ctx.uri.pathname)){
+      this.handleError(ctx,500,'The server side path cannot be access by url')
+      return
+    }
+    return new Promise((resolve,reject)=>{
+      const filename = path.join(this.root, ctx.uri.pathname);
+      fs.readFile(filename,function(err,data){
+        if(!err){
+          let extAt = filename.lastIndexOf('.')
+          if(extAt>0){
+            let ext = filename.substring(extAt)
+            let ct =  contentTypes[ext]
+            if(ct){
+              ctx.res.writeHead(200,{'Content-Type':ct})
+            }else ctx.res.writeHead(200)
+          }
+          ctx.res.end(data)
+          resolve(true)
+        }else {
+          resolve(false)
+        }
+      });
+    })
+    
+  }
+  private async _handleHttpBody(ctx){
+    return new Promise((resolve,reject)=>{
+      let post = '';
+      ctx.req.on('data',(chunk)=>{
+          post+=chunk;
+      });
+      ctx.req.on('end',()=>{
+          //将字符串变为json的格式
+          //post  =  querystring.parse(post);
+          //向前端返回字符串
+          resolve(post)
+      });
+    })
+    
+  }
+  async handeCommand(ctx:WebContext){
+    const commandLine = ctx.commandLine
+    let cmd = this._commands[commandLine]
+    if(!cmd){
+      let pathnames = commandLine.split('/')
+      pathnames.shift() // 去掉前导/
+      let modname = pathnames.shift() 
+      let mod = ctx.host._modules[modname]
+      if(!mod){
+        let modpath = path.join(ctx.host.root,modname)
+        fs.stat(modpath,(err,stat)=>{
+          if(stat.isDirectory()){
+            mod = new Module(ctx.host,modname,modpath)
+            this._modules[modname] = mod
+          }else {
+            mod = this._modules[""]
+            if(!mod) this._modules[''] = mod = new Module(ctx.host,'',ctx.host.root)
+          }
+          mod.start(ctx,(mod)=>{
+            mod.retriveCommand(pathnames,(cmd)=>{
+              if(!cmd) return this.handleError(ctx,404,"cannot found path:" + ctx.uri.pathname)
+              this._commands[cmd.fullPath] = cmd
+              cmd.execute(ctx)
+            })
+          })
+          
+        });
+      }
+      
+    }else cmd.execute(ctx)
+  }
+}
+
+class UrlEncodeParser{
+  constructor(public req){
+
+  }
+  async parse(req:http.IncomingMessage):Promise<any>{
+    return new Promise((resolve,reject)=>{
+      let postData = {}
+      let postName,postValue,lastChunk,lastAt
+      req.on('data',(chunk)=>{
+        // let at
+        // if(postName===undefined) at = chunk.indexOf('=')
+      });
+      req.on('end',()=>{
+          //将字符串变为json的格式
+          //post  =  querystring.parse(post);
+          //向前端返回字符串
+          resolve(post)
+      });
+    })
+  }
+}
+
+class WebContext extends InjectScope{
+  req:http.IncomingMessage
+  res:http.ServerResponse
+  host:WebHost
+  scope:InjectScope
+  method:string
+  url: string
+  commandLine:string
+  private _uri:url.UrlWithStringQuery
+  private _get:querystring.ParsedUrlQuery
+  private _post:querystring.ParsedUrlQuery
+  private _input:{[name:string]:any}
+  req_body:string
+
+  constructor(req:http.IncomingMessage, res:http.ServerResponse,host:WebHost){
+    super('<Context>',host)
+    internalDescriptor.value = this
+    Object.defineProperty(this,'scope',internalDescriptor)
+    publicReadonlyDescriptor.value = req
+    Object.defineProperty(this,'req',publicReadonlyDescriptor)
+    publicReadonlyDescriptor.value = res
+    Object.defineProperty(this,'res',publicReadonlyDescriptor)
+    publicReadonlyDescriptor.value = url
+    Object.defineProperty(this,'url',publicReadonlyDescriptor)
+    publicReadonlyDescriptor.value = req.method
+    Object.defineProperty(this,'method',publicReadonlyDescriptor)
+    publicReadonlyDescriptor.value = host
+    Object.defineProperty(this,'host',publicReadonlyDescriptor)
+    this.register('url',this.url).register('context',this)
+    .register('$GET',()=>this.get(),true)
+    .register('$POST',()=>this.post(),true)
+    .register('$INPUT',()=>this.input(),true)
+  }
+  get uri(){
+		if(this._uri) return this._uri
+    privateReadonlyDescriptor.value =  Object.freeze(url.parse(this.req.url))
+    Object.defineProperty(this,'_uri',privateReadonlyDescriptor)
+    return privateReadonlyDescriptor.value
+	}
+  get(name?:string){
+    if(!this._get){
+      privateReadonlyDescriptor.value = Object.freeze(querystring.parse(this.uri.query))
+      Object.defineProperty(this,'_get',privateReadonlyDescriptor)
+    }
+    if(name===undefined) return this._get
+    return this._get[name]
+  }
+  post(name?:string){
+    if(!this._post){
+      let post
+      if(!this.req_body) post={}
+      else {
+        if(jsonRegx.test(this.req_body)){
+          post = JSON.parse(this.req_body)
+        }else {
+          post = querystring.parse(this.req_body)
+        }
+        privateReadonlyDescriptor.value = Object.freeze(post)
+        Object.defineProperty(this,'_post',privateReadonlyDescriptor)
+      }
+    }
+    if(name===undefined) return this._post
+    return this._post[name]
+    
+  }
+  req_header(name?:string){
+    if(name===undefined) return this.req.headers
+    return this.req.headers[name] 
+  }
+  input(name?:string){
+    if(name===undefined){
+      if(this._input) return this._input
+      const input = {}
+      let headers = this.req_header()
+      for(let n in headers as any) input[n] = headers[n]
+      let gets = this.get()
+      for(let n in gets as any) input[n] = gets[n]
+      let posts = this.post()
+      for(let n in posts as any) input[n] = posts[n]
+      privateReadonlyDescriptor.value = Object.freeze(input)
+      Object.defineProperty(this,'_input',privateReadonlyDescriptor)
+      return this._input
+    }
+    let value = this.post(name)
+    if(value===undefined) value = this.get(name)
+    if(value===undefined) value = this.req_header(name)
+    return value
+  }
+  
+}
+
+class HandleResult{
+  status:number
+  headers?:{[name:string]:string}
+  constructor(){
+    
+  }
+}
+
+
+export class Module{
+  public dir:string
+  public host:WebHost
+  public name:string
+  public instance:any
+  private _injectors:{[name:string]:{():any}}
+  private _commands:{[ctrlname:string]:{[actionname:string]:Command}}
+  public constructor(host:WebHost,name:string,dir:string){
+    publicReadonlyDescriptor.value = host
+    Object.defineProperty(this,'host',publicReadonlyDescriptor)
+    publicReadonlyDescriptor.value = name
+    Object.defineProperty(this,'name',publicReadonlyDescriptor)
+    publicReadonlyDescriptor.value = dir
+    Object.defineProperty(this,'dir',publicReadonlyDescriptor)
+    privateReadonlyDescriptor.value = {'$module':()=>this}
+      Object.defineProperty(this,'_injectors',privateReadonlyDescriptor)
+  }
+  start(ctx:WebContext,cb:(module:Module)=>void):Module{
+    if(this.instance){
+      cb(this)
+      return this;
+    }
+    console.log('启动模块:' + this.name)
+    const modInstFile = path.join(this.dir,'/.serv-side/module.js')
+    fs.stat(modInstFile,function(err,stat){
+			if(err || !stat.isFile()){
+        publicReadonlyDescriptor.value = {}
+        Object.defineProperty(this,'instance',publicReadonlyDescriptor)
+        console.log(`未找到模块文件，使用新创建的默认的模块实例:${modInstFile}`)
+			}else {
+        const modCls = require(modInstFile)
+        console.log(`已加载模块文件:${modInstFile}`)
+        let inst = ctx.createInstance(modCls)
+        publicReadonlyDescriptor.value = inst
+        Object.defineProperty(this,'instance',publicReadonlyDescriptor)
+      }
+      cb(this)
+      return this
+		});
+  }
+
+  register(name:string,value:any,isFactory?:boolean): Module{
+    
+    if(isFactory){
+      this._injectors[name] = value
+    }else this._injectors[name] = ()=>value
+
+    return this
+  }
+
+  createScope(ctx:WebContext):InjectScope{
+    return new InjectScope(`<${this.name}>`,ctx,this._injectors)
+  }
+
+  retriveCommand(paths:string[],cb:(cmd:Command)=>void): Module{
+    const ctrlrname = paths.shift()
+    const actionName = paths.shift()
+    let ctrlr = this._commands[ctrlrname]
+    if(!ctrlr) {
+      const ctrlrFilename = path.join(this.dir,`/.serv-side/${ctrlrname}.controller.js`)
+      fs.stat(ctrlrFilename,function(err,stat){
+        if(err || !stat.isFile()){
+          cb(null);return;
+        }else {
+          const ctrlrCls = require(ctrlrFilename)
+          let proto = ctrlrCls.prototype
+          while(proto){
+            let actionPds = Object.getOwnPropertyDescriptors(proto)
+            for(let name in actionPds){
+              if(name==='constructor' || ctrlr[name]) continue
+              let actionFn = actionPds.value
+              if(typeof actionFn!='function') continue
+              if(actionFn['--attrs'] && actionFn['--attrs']['action']===null) continue
+              let cmd = new Command(this,ctrlrCls,actionFn,name)
+              ctrlr[name] = cmd
+            }
+            proto = Object.getPrototypeOf(proto)
+            if(proto===Object.prototype) break
+          }
+          const cmd = ctrlr[actionName]
+          cb(cmd)
+        }
+      })
+    }else {
+      
+      const cmd = ctrlr[actionName]
+      cb(cmd)
+    }
+    return this
+  }
+}
+
+class Command{
+  controllerCls:any
+  name:string
+  path:string
+  fullPath:string
+  action:Function
+  module:Module
+  private __params:string[]
+
+	constructor(module:Module,ctrlrCls:{new(...args):any},fn:Function,actionName:string){
+		this.controllerCls = ctrlrCls
+		this.name = actionName
+    this.action = fn
+    this.module = module
+	}
+	execute(ctx){
+    let moduleScope = this.module.createScope(ctx)
+    let modInst = this.module.instance
+    
+		const ctrlr = new this.controllerCls(ctx)
+    const args = this.makeArgs(ctx,action)
+    let actionResult
+    if(args.length===0) actionResult = action.call(ctrlr)
+    else if(args.length===1) actionResult = action.call(ctrlr,args[0])
+    else actionResult = action.apply(ctrlr,args)
+    
+		if(typeof actionResult==='object'){
+			actionResult = JSON.stringify(actionResult)
+		}
+		ctx.res.end(actionResult)
+	}
+  private _executeAction(inst:any,fn:Function,ctx:WebContext,scope:InjectScope){
+    const args = this._makeArgs(ctx,scope,fn)
+
+
+
+  }
+
+  
+
+  private _makeArgs(ctx:WebContext,scope:InjectScope,fn:Function){
+    let args = []
+    let argnames = InjectScope.argnames(fn)
+    if(argnames.length===1){
+      const argname = argnames[0]
+      let argval = ctx.input(argname)
+      if(argval===undefined) argval = scope.resolve(argname) 
+      if(argval===undefined){
+        if(ctx.method==='POST' || ctx.method==='PUT') args.push(ctx.post())
+        else args.push(ctx.get())
+      }else args.push(argval)
+    }else {
+      for(let argname of argnames) {
+        let argval = ctx.input(argname)
+        if(argval===undefined) argval = scope.resolve(argname) 
+        args.push(argval)
+      }
+    }
+    return args
+  }
+}
+
+
+
+const server = new WebHost({port:8001})
+server.run()

@@ -1,0 +1,1295 @@
+/*
+参考资料:https://zhuanlan.zhihu.com/p/127889084
+*/
+import {IncomingMessage,ServerResponse,createServer,Server} from 'http'
+import * as crypto from 'crypto'
+import * as url from 'url'
+import * as net from 'net'
+import * as querystring from 'querystring'
+import * as path from 'path'
+import * as fs from 'fs'
+
+function modifier(descriptor,target?,name?,value?){
+	const tt = typeof target
+	let actualTarget
+	if(tt==='object') actualTarget = target
+	else if(tt==='function') actualTarget = target.prototype
+	else throw new Error('target必须是object/function')
+
+	if(name!==undefined){
+		const nt = typeof name
+		if(nt==='string'){
+			descriptor.value = value
+			Object.defineProperty(actualTarget,name,descriptor)
+		}else if(nt==='object'){
+			if(Array.isArray(name)){
+				const keys = name
+				for(let key of keys) {
+					descriptor.value = actualTarget[key]
+					Object.defineProperty(actualTarget,key,descriptor)
+				}
+			}else {
+				const keys = Object.keys(name)
+				for(let key of keys) {
+					descriptor.value = name[key]
+					Object.defineProperty(actualTarget,key,descriptor)
+				}
+			}
+			
+		}else throw new Error('name必须是字串或者对象')
+	}else {
+		let keys = Object.keys(actualTarget)
+		for(let key of keys) {
+			descriptor.value = actualTarget[key]
+			Object.defineProperty(actualTarget,key,descriptor)
+		}
+	}
+}
+function constant(target?:Object|Function,name?:string|Object|string[],value?:any){
+	let descriptor ={enumerable:true,writable:false,configurable:false,value:undefined}
+	if(target===undefined){
+		return function(target,name?){
+			return modifier(descriptor,target,name)
+		}
+	}else return modifier(descriptor,target,name,value)
+}
+function readonly(target?:Object|Function,name?:string|Object|string[],value?:any){
+	let descriptor ={enumerable:true,writable:false,configurable:true,value:undefined}
+	if(target===undefined){
+		return function(target,name?){
+			return modifier(descriptor,target,name)
+		}
+	}else return modifier(descriptor,target,name,value)
+}
+function internal(target?:Object|Function,name?:string|Object|string[],value?:any){
+	let descriptor ={enumerable:false,writable:false,configurable:true,value:undefined}
+	if(target===undefined){
+		return function(target,name?){
+			return modifier(descriptor,target,name)
+		}
+	}else return modifier(descriptor,target,name,value)
+}
+
+function secret(target?:Object|Function,name?:string|Object|string[],value?:any){
+	let descriptor ={enumerable:false,writable:false,configurable:false,value:undefined}
+	if(target===undefined){
+		return function(target,name?){
+			return modifier(descriptor,target,name)
+		}
+	}else return modifier(descriptor,target,name,value)
+}
+
+
+function implicit(target?:Object|Function,name?:string|Object|string[],value?:any){
+	let descriptor ={enumerable:false,writable:true,configurable:true,value:undefined}
+	if(target===undefined){
+		return function(target,name?){
+			return modifier(descriptor,target,name)
+		}
+	}else return modifier(descriptor,target,name,value)
+}
+
+
+const servRegx = /\/\.\-serv\-side\//g
+const jsonRegx = /(^\s*\{)|(^\s*\[)|(^\s*')|(^\s*")|(\s*\d+(\.\d+)?\s*$)/gi
+const trimRegx = /(^\s+)|(\s+$)/g
+
+
+/**
+ * 依赖注入类
+ *
+ * @class Injection
+ */
+ class InjectScope{
+	private _injectors:{[name:string]:{():any}}
+	scopeName:string
+	scopeParent:InjectScope
+	constructor(name?:string,parent?:InjectScope,preInjectors?:{[name:string]:{():any}}){
+	  readonly(this,'scopeParent',parent)
+	  readonly(this,'scopeName',name)
+	  if(preInjectors){
+		internal(this,'_injectors',preInjectors)
+	  }
+	}
+	resolveInstance(name:string){
+	  if(this._injectors){
+		const injector = this._injectors[name]
+		if(injector){
+		  return injector()
+		}
+		return this.scopeParent?this.scopeParent.resolveInstance(name):undefined
+	  }
+	  return this.scopeParent?this.scopeParent.resolveInstance(name):undefined
+	}
+	registerFactory(name:string,value:any,isFactory?:boolean):InjectScope{
+	  if(!this._injectors) {
+		readonly(this,'_injectors',{})
+	  }
+	  if(isFactory){
+		this._injectors[name] = value
+	  }else this._injectors[name] = ()=>value
+	  return this
+	}
+	createInstance(ctor:{new(...args):any}){
+	  const argnames = InjectScope.argnames(ctor)
+	  const args = []
+	  for(let an of argnames){
+		args.push(this.resolveInstance(an))
+	  }
+	  return InjectScope.createInstance(ctor,args)
+	}
+  
+	static createInstance(ctor:{new(...args):any},args?:any[]){
+	  // 创建一个空对象，继承构造函数的原型对象
+	  let res = Object.create(ctor.prototype);
+		// 执行构造函数，传递上下文和参数
+	  let ret;
+	  if(!args || args.length===0) ret = ctor.call(res)
+	  else if(args.length===1) ret = ctor.call(res,args.shift())
+	  else ret = ctor.apply(res, args||[]);
+	  if (typeof ret === 'object' && ret !== null) {
+		return ret
+	  } else {
+		return res
+	  }
+	}
+  
+	
+  
+	static argnames(fn:Function):string[]{
+	  if((fn as any)['--argnames']) return (fn as any)['--argnames']
+	  const code = fn.toString()
+	  const begin = code.indexOf('(')
+	  const end = code.indexOf(')',begin)
+	  const argslist= code.substr(begin+1,end-begin)
+	  let args = argslist.split(',')
+	  for(let i =0,j=args.length;i<j;i++){
+		let arg = args.shift().replace(trimRegx,'')
+		args.push(arg)
+	  }
+	  secret(fn,'--argnames',Object.freeze(args))
+	  return args
+	}
+	static global:InjectScope
+}
+constant(InjectScope,'global',new InjectScope("<GLOBAL>",null))
+
+export enum LogLevels{
+	error=0,
+	warn,
+	info,
+	log,
+	trace
+}
+
+export interface ILogger{
+	level:LogLevels
+	trace(...args):ILogger
+	log(...args):ILogger
+	info(...args):ILogger
+	warn(...args):ILogger
+	error(...args):ILogger
+}
+export class ConsoleLogger implements ILogger{
+	level = 0
+	trace(...args):ILogger{
+		if(this.level<LogLevels.trace) return this
+		args.unshift(new Date())
+		args.unshift(' ')
+		console.debug.apply(console,args)
+		return this
+	}
+	log(...args):ILogger{
+		if(this.level<LogLevels.log) return this
+		args.unshift(new Date())
+		args.unshift(' ')
+		console.log.apply(console,args)
+		return this
+	}
+	info(...args):ILogger{
+		if(this.level<LogLevels.info) return this
+		args.unshift(new Date())
+		args.unshift(' ')
+		console.info.apply(console,args)
+		return this
+	}
+	warn(...args):ILogger{
+		if(this.level<LogLevels.warn) return this
+		args.unshift(new Date())
+		args.unshift(' ')
+		console.warn.apply(console,args)
+		return this
+	}
+	error(...args):ILogger{
+		if(this.level<LogLevels.error) return this
+		args.unshift(new Date())
+		args.unshift(' ')
+		console.error.apply(console,args)
+		return this
+	}
+}
+
+export interface WebHostOptions{
+	name?:string,
+	port?:number
+	root?:string
+	useStatic?:boolean
+	logLevel?:string|Number
+}
+
+/**
+ * Web主机，打开监听
+ * 接收客户端连接
+ *
+ * @class WebHost
+ */
+class WebHost extends InjectScope{
+	opts:WebHostOptions
+	port:number
+	root:string
+	logLevel:LogLevels
+	private _logger:ILogger
+	private _rawServ:Server
+	commands:{[path:string]:Command}
+	module:Module
+	constructor(opts:WebHostOptions){
+		super('<HOST>')
+		constant(this,'opts',Object.freeze(opts||{}))
+		let logLevel = typeof opts.logLevel==='string'?LogLevels[opts.logLevel]:opts.logLevel as LogLevels
+		this.logLevel = logLevel
+		constant(this,{
+			port: opts.port || 8001
+			,root: opts.root || path.join(__dirname,'../root/')
+		})
+		internal(this,'_commands',{})
+	}
+	start():WebHost{
+		if(this._rawServ){
+			this.logger.warn('服务器已经启动，不正确的start操作')
+			return this
+		}
+		internal(this,'_rawServ',createServer((req:IncomingMessage,res:ServerResponse)=>{
+			this.logger.trace('连接接入:',req.url)
+			//创建连接对象
+			const connect = new WebConnection(this,req,res)
+			this._useWS(connect)
+			const request = Host_makeRequest(connect)
+			
+
+			res.write("有连接接入")
+			res.end()
+		}))
+		
+		this.logger.info('服务器已创建')
+		this._rawServ.listen(this.port)
+		this.logger.info('开始监听端口:' + this.port)
+		return this
+	}
+	stop():WebHost{
+		if(!this._rawServ) {
+			this.logger.warn('服务器尚未启动，不正确的stop操作')
+			return this
+		}
+		this._rawServ.close((err)=>{
+			if(err){
+				this.logger.error('服务器关闭发生错误',err);
+			}else this.logger.info('服务器已关闭')
+		})
+		internal(this,'_rawServ',null)
+		this.logger.info('正在关闭服务器')
+		return this
+	}
+	get logger(){
+		if(this._logger) return this._logger
+		const logger = this.resolveInstance('logger') || new ConsoleLogger()
+		internal(this,'_logger',logger)
+		logger.level = this.logLevel
+		return logger
+	}
+	private _useWS(connect:WebConnection){
+		// WebSocket支持
+		this._rawServ.on('upgrade', (req, socket, head) => {
+			//WS握手协议
+			//Sec-WebSocket-Accept这个返回头
+			//1 是根据客户端的请求头sec-websocket-key
+			//2 加上全局唯一ID(258EAFA5-E914-47DA-95CA-C5AB0DC85B11)后
+			//3 使用sha1摘要后，
+			//4 再以base64格式输出
+			//https://datatracker.ietf.org/doc/html/rfc6455
+			const secWebsocketKey = req.headers['sec-websocket-key']
+			const secWebSocketAccept=crypto.createHash('sha1').update(`${secWebsocketKey}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+			socket.write('HTTP/1.1 101 Web Socket Protocol Handshake\r\n' +
+			'Upgrade: WebSocket\r\n' +
+			'Connection: Upgrade\r\n' +
+			'Sec-WebSocket-Accept: '+ secWebSocketAccept +'\r\n' +
+			'\r\n');
+			socket.pipe(socket); // echo back
+			this.logger.trace('WS请求返回握手信息:',req.url)
+			readonly(connect,'protocol','ws')
+		});
+	}
+	private makeRequest(connect:WebConnection){
+
+	}
+}
+
+function Host_makeRequest(conn:WebConnection):WebRequest{
+	for(let reqCtor of WebConnection.requestTypes){
+		let req = (reqCtor as any).make(this)
+		if(req) return req
+	}
+	return new HttpRequest(conn)
+}
+async function Host_processRequest(request:WebRequest){
+	const router = new Router(request)
+	const command = await router.resolveCommand()
+	const rs = await command.execute(request)
+	
+
+}
+
+/**
+ * 代表一个客户端连接
+ * 可能是长连接
+ * 也可能是短连接
+ *
+ * @class WebConnection
+ */
+class WebConnection extends InjectScope{
+	host:WebHost
+	protocol:string
+	incoming:IncomingMessage
+	outgoing:ServerResponse
+	constructor(host,req,res){
+		super('<CONNECT>',host)
+		constant(this,'host',host)
+		constant(this,'incoming',req)
+		constant(this,'outgoing',res)
+	}	
+	
+	static requestTypes:{new (...args):WebRequest}[]
+}
+constant(WebConnection,'requestTypes',[])
+
+
+
+export class WebRequest extends Promise<any[]>{
+	method?:string
+	url:string
+	contentType?:ContentType
+	buffer:Buffer
+	protected _data:any
+	connection:WebConnection
+	parsers:{(request:HttpRequest,buffer:Buffer):any}[]
+	constructor(conn:WebConnection,asyncFn){
+		super(asyncFn)
+		constant(this,'connection',conn)
+		constant(this,'url',conn.incoming.url)
+		internal(this,'_data',null)
+	}
+	data(key?:string):any{
+		if(!this._data){
+			if(this.buffer===undefined) throw new Error('Request未完成或未设置buffer')
+			secret(this,'_data',Object.freeze(this._parseData(this.buffer)))
+		}
+		if(key) return this._data[key]
+		return this._data
+	}
+	protected _parseData(buffer:Buffer):any{
+		throw new Error('not override')
+	}
+	write_header(code:number,headers?:any):WebRequest{
+		throw new Error("Not overrided")
+	}
+	write_body(content:any):WebRequest{
+		throw new Error("Not overrided")
+	}
+	end(cb?:any){
+		throw new Error("Not overrided")
+	}
+
+	write_error(code:number,errDetails:any):boolean{
+		throw new Error("Not overrided")
+		return false
+	}
+	
+}
+
+
+class HttpRequest extends WebRequest{
+	constructor(conn:WebConnection){
+		super(conn,(resolve,reject)=>{
+			if(conn.incoming.method==='POST' || conn.incoming.method==='PUT'){
+				let datas= []
+				let size = 0
+				conn.incoming.on('data',(data:Buffer)=>{
+					datas.push(data as any)
+					size += data.length
+				})
+				conn.incoming.on('end',(data)=>{
+					//if(data) datas.push(data)
+					let buffer = Buffer.concat(datas,size)
+					constant(this,'buffer',buffer)
+					resolve(buffer)
+				})
+			}else resolve(null)
+		})
+		let ct :any= conn.incoming.headers['Content-Type']||""
+		if(ct && ct.push) ct = ct[0]
+		let contentType = new ContentType(ct)
+		constant(this,'contentType',Object.freeze(contentType))
+		
+	}
+	protected _parseData(buffer:Buffer){
+		if(this.parsers){
+			for(let parser of this.parsers){
+				let data = parser(this,buffer)
+				if(data!==undefined) return data
+			}
+		}
+		for(let parser of HttpRequest.parsers){
+			let data = parser(this,buffer)
+			if(data!==undefined) return data
+		}
+		this.connection.host.logger.warn("未能分析出请求的数据",this.url,this.contentType);
+		
+		return null
+	}
+	write_header(code:number,headers?):HttpRequest{
+		this.connection.outgoing.writeHead(code,headers)
+		return this
+	}
+	write_body(buffer:Buffer):HttpRequest{
+		this.connection.outgoing.write(buffer)
+		return this
+	}
+	end(cb?):HttpRequest{
+		this.connection.outgoing.end(cb)
+		return this
+	}
+	static make(conn:WebConnection){
+		if(conn.protocol==='http') return new HttpRequest(conn)
+	}
+	static parsers:{(request:HttpRequest,buffer:Buffer):any}[]
+}
+
+constant(HttpRequest,'parsers',[])
+
+function parseFormMultipart(request:HttpRequest,buffer:Buffer){
+	if(request.contentType.mime!==Mime.multipart) return
+	let boundary = request.contentType.params['boundary']
+	if(!boundary){
+		request.connection.host.logger.warn('请求为multipart,但未能找到boundary参数',request.url);
+		return
+		
+	}
+	//Content-Type:multipart/form-data; boundary=ZnGpDtePMx0KrHh_G0X99Yef9r8JZsRJSXC
+	boundary = '--' + boundary + '\r\n'
+	const  cd = 'Content-Disposition: form-data;'
+	let lastTokenAt
+	let data = {}
+	let item
+	
+	while(true){
+		let at = buffer.indexOf(boundary,lastTokenAt)
+		if(at<0)break
+		if(item){
+			item.buffer = buffer.slice(lastTokenAt,at)
+			if(!item.filename)data[item.name] = item.buffer.toString()
+			else data[item.name] = item
+			item = {}
+		}else item ={}
+		at += boundary.length
+		
+		while(true){
+			let lineEnd = buffer.indexOf('\r\n',at)
+			let line:string
+			if(lineEnd>=0) line = buffer.toString('base64url',at,lineEnd).replace(trimRegx,'')
+			at = lineEnd
+			if(!line){
+				//空行，后面开始跟数据
+				lastTokenAt = lineEnd + 2
+				break
+			}else {
+				if(line.startsWith(cd)){
+					line = line.substr(cd.length)
+				}
+				let p = line.split(';')
+				for(let pa of p){
+					const kv = pa.split('=')
+					item[kv[0].trim()] = kv[1].trim()
+				}
+			}
+		}
+	}
+}
+HttpRequest.parsers.push(parseFormMultipart)
+
+function parseFormUrlEncoded(request:HttpRequest,buffer:Buffer){
+	if((request.method!=='POST' && request.method!=='PUT')){
+		return null
+	}
+	let key,token = '='.charCodeAt(0)
+	let lastTokenAt=0
+	let data = {}
+	while(true){
+		let at = buffer.indexOf(token,lastTokenAt)
+		if(at<0)break
+		let text = buffer.toString('base64url',lastTokenAt,at-1)
+		if(key===undefined) {
+			key = text
+			token = '&'.charCodeAt(0)
+		}else{
+			data[key] = text
+			token = '='.charCodeAt(0)
+			key = undefined 
+		}
+		lastTokenAt = at
+	}
+	
+	if(key!==undefined){
+		let text =  buffer.toString('base64url',lastTokenAt)
+		data = text
+	}
+}
+HttpRequest.parsers.push(parseFormUrlEncoded)
+function parseJsonBody(request:WebRequest,buffer:Buffer){
+	if(request.contentType.mime.subtype!=='json' || (request.method!=='POST' && request.method!=='PUT')){
+		return
+	}
+	let charset:BufferEncoding = request.contentType.params['charset'] as BufferEncoding
+	if(!charset) charset = 'utf8'
+	return JSON.parse(buffer.toString(charset))
+}
+HttpRequest.parsers.push(parseJsonBody)
+
+class WSRequest extends Promise<any[]>{
+	datas:any[]
+	connection:WebConnection
+	constructor(conn:WebConnection){
+		super((resolve,reject)=>{
+			let buffers=[]
+			conn.incoming.on('data',(buffer)=>{
+				let frame = decodeWSFrame(buffer)
+				if(frame.fin){
+					resolve([frame.payloadData])
+				}
+			})
+		})
+	}
+	static make(conn:WebConnection){
+		if(conn.protocol==='ws') return new WSRequest(conn)
+	}
+}
+//Request.requestTypes.push(HttpRequest)
+
+/**
+    我在第二三行重新加了个按字节和比特来计算的比例尺
+     0                   1                   2                   3
+     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+                   1               2               3               4
+     0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
+    +-+-+-+-+-------+-+-------------+-------------------------------+
+    |F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+    |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+    |N|V|V|V|       |S|             |   (if payload len==126/127)   |
+    | |1|2|3|       |K|             |                               |
+    +-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
+    |     Extended payload length continued, if payload len == 127  |
+    + - - - - - - - - - - - - - - - +-------------------------------+
+    |                               |Masking-key, if MASK set to 1  |
+    +-------------------------------+-------------------------------+
+    | Masking-key (continued)       |          Payload Data         |
+    +-------------------------------- - - - - - - - - - - - - - - - +
+    :                     Payload Data continued ...                :
+    + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+    |                     Payload Data continued ...                |
+    +---------------------------------------------------------------+
+    */
+export interface IWSFrame{
+	fin:number,
+	opcode:number,
+	mask:number,
+	payloadLen:number,
+	maskingKey:number[]
+	payloadData:Buffer
+}
+function decodeWSFrame (bufData){
+    let bufIndex = 0
+    const byte1 = bufData.readUInt8(bufIndex++)
+    const byte2 = bufData.readUInt8(bufIndex++)
+    const frame :IWSFrame=  {
+        fin:		byte1 & 0b10000000,
+        // RSV是保留字段，暂时不计算
+        opcode:		byte1 & 0b00001111,
+        mask:		byte2 & 0b10000000,
+        payloadLen:	byte2 & 0b01111111,
+		maskingKey:undefined,
+		payloadData:undefined
+    }
+    // 如果frame.payloadLen为126或127说明这个长度不够了，要使用扩展长度了
+    // 如果frame.payloadLen为126，则使用Extended payload length同时为16/8字节数
+    // 如果frame.payloadLen为127，则使用Extended payload length同时为64/8字节数
+    // 注意payloadLen得长度单位是字节(bytes)而不是比特(bit)
+    if(frame.payloadLen==126) {
+        frame.payloadLen = bufData.readUIntBE(bufIndex,2);
+        bufIndex+=2;
+    } else if(frame.payloadLen==127) {
+        // 虽然是8字节，但是前四字节目前留空，因为int型是4字节不留空int会溢出
+        bufIndex+=4;
+        frame.payloadLen = bufData.readUIntBE(bufIndex,4);
+        bufIndex+=4;
+    }
+    if(frame.mask){
+        const payloadBufList = []
+        // maskingKey为4字节数据
+        frame.maskingKey=[bufData[bufIndex++],bufData[bufIndex++],bufData[bufIndex++],bufData[bufIndex++]];
+        for(let i=0;i<frame.payloadLen;i++) {
+            payloadBufList.push(bufData[bufIndex+i]^frame.maskingKey[i%4]);
+        }
+        frame.payloadData = Buffer.from(payloadBufList)
+    } else {
+        frame.payloadData = bufData.slice(bufIndex,bufIndex+frame.payloadLen)
+    }
+    return frame
+}
+
+function encodeWSFrame (frame:IWSFrame){
+    const frameBufList = [];
+    // 对fin位移七位则为10000000加opcode为10000001
+    const header = (frame.fin<<7)+frame.opcode;
+    console.log(header)
+    frameBufList.push(header)
+    const bufBits = Buffer.byteLength(frame.payloadData);
+    let payloadLen = bufBits;
+    let extBuf;
+    if(bufBits>=126) {
+        //65536是2**16即两字节数字极限
+        if(bufBits>=65536) {
+            extBuf = Buffer.allocUnsafe(8);
+            extBuf.writeUInt32BE(bufBits, 4);
+            payloadLen = 127;
+        } else {
+            extBuf = Buffer.allocUnsafe(2);
+            extBuf.writeUInt16BE(bufBits, 0);
+            payloadLen = 126;
+        }
+    }
+    let payloadLenBinStr = payloadLen.toString(2);
+    while(payloadLenBinStr.length<8){payloadLenBinStr='0'+payloadLenBinStr;}
+    frameBufList.push(parseInt(payloadLenBinStr,2));
+    if(bufBits>=126) {
+        frameBufList.push(extBuf);
+    }
+    frameBufList.push(...frame.payloadData)
+    return Buffer.from(frameBufList)
+}
+
+
+
+
+
+/**
+ * 路由
+ * 核心任务是找到Command
+ *
+ * @class Router
+ */
+class Router{
+	request:WebRequest
+	uri:URL
+	constructor(req:WebRequest){
+		constant(this,'request',req)
+		constant(this,'uri',Object.freeze(new URL(this.request.url)))
+	}
+	resolveCommand():Promise<Command>{
+		return new Promise((resolve,reject)=>{
+			const pathname = this.uri.pathname
+			const host = this.request.connection.host
+			let cmd = host.commands[pathname]
+			if(cmd) return resolve(cmd)
+			if(host.opts.useStatic){
+				const staticFileName = path.join(host.root, pathname)
+				fs.readFile(staticFileName,(err,data)=>{
+					if(!err){
+						resolve(new FileCommand(pathname,staticFileName,data))
+						return
+					}
+					let routes = this.uri.pathname.replace(/(^\/)|(\/$)/g,"").split('/')
+					host.module.resolveCommand(this,routes).then(resolve)
+				})
+			}
+			let routes = this.uri.pathname.replace(/(^\/)|(\/$)/g,"").split('/')
+			host.module.resolveCommand(this,routes).then(resolve)
+
+		})
+	}
+}
+function Router_findCommand(router:Router,resolve){
+	
+
+}
+
+export class WebApplication {
+
+}
+
+export class Module extends InjectScope{
+	pathname:string
+	name:string
+	dir:string
+	hooks:any
+	parent:Module
+	private modules:{[name:string]:Command}
+	private controllers:{[name:string]:ControllerInfo}
+	constructor(name:string,hookCtor:{new (mod:Module,request:WebRequest):any},request:WebRequest,parent?:Module){
+		super(`<${name}>`,parent?parent:request.connection.host)
+		constant(this,'name',name)
+		let dir
+		if(parent) dir = path.join(parent.dir,name)
+		else {
+			let app = this as WebApplication
+			//dir = app.opts.root
+		}
+		constant(this,'dir',dir)
+		let hooks = new hookCtor(this,request)
+		constant(this,'hooks',hooks)
+		secret(this,'modules',{})
+		
+	}
+	
+	async resolveCommand(router:Router,pathnames:string[]):Promise<Command>{
+		let name = pathnames.shift()
+		let ctrlrInfo = this.controllers[name]
+		if(ctrlrInfo){
+			let methodname = pathnames.shift() || ""
+			return ctrlrInfo.commands[methodname]
+		}
+		let mod = await this.resolveSub(name,router.request)
+		if(mod) return mod.resolveCommand(router,pathnames)
+		return null
+		
+	} 
+	resolveSub(name:string,req:WebRequest):Promise<Module>{
+		return Module.resolve(req,this.dir,name,this)
+	}
+	static resolve(req:WebRequest,basDir:string,name:string,parent?:Module):Promise<Module>{
+		return new Promise((resolve)=>{
+			let servDir = path.join(basDir,name,'/.serv-side')
+			fs.readdir(servDir,(err,files)=>{
+				if(err)return resolve(null)
+				let modFile = path.join(servDir,'__hooks__.js')
+				fs.stat(modFile,(err,stat)=>{
+					let hookCtor
+					if(err|| !stat.isFile()){
+						hookCtor=ModuleHooks
+					}else {
+						hookCtor = require(modFile)
+					}
+					let mod = new Module(name,hookCtor,req,parent)
+					let controllers = {}
+					for(let file of files){
+						controllerFileRegx.lastIndex=0
+						const match = controllerFileRegx.exec(file)
+						if(match){
+							const controllerName = match[1];
+							const ctor = require(file) as any
+							controllers[controllerName] = new ControllerInfo(ctor,controllerName,file,mod)
+						}
+					}
+					constant(this,'controllers',controllers)
+					resolve(mod)
+				})
+			})
+			
+		})
+	}
+}
+
+const controllerFileRegx = /([a-zA-Z0-9\-_]+).controller.js$/g
+
+
+
+function Module_resolveController(mod:Module,name:string){
+	return new Promise((resolve,reject)=>{
+		let ctrlrFilename = path.join(mod.dir,name+".controller.js")
+	})
+	
+}
+class ModuleHooks{}
+
+class ControllerInfo{
+	controllerCtor:{new (...args):any}
+	module:Module
+	file:string
+	commands:{[name:string]:Command}
+	name:string
+	pathname:string
+	defaultCommand:Command
+	constructor(controllerCtor:{new (...args):any},name:string,file:string,module:Module){
+		constant(this,'controllerCtor',controllerCtor)
+		constant(this,'name',name)
+		constant(this,'file',file)
+		constant(this,'commands',{})
+		constant(this,'pathname',path.join(module.pathname,name))
+	}
+	resolveCommand(name:string):Command{
+		let cmd = this.commands[name]
+		if(cmd) return cmd
+		let proto = this.controllerCtor.prototype
+		while(proto!==Object.prototype){
+			let mtd = proto[name]
+			if(typeof mtd==='function'){
+				cmd = new ControllerCommand(name,this)
+				return this.commands[name] = cmd
+			}
+			proto = Object.getPrototypeOf(proto)
+		}
+		return null
+	}
+}
+
+class Command{
+	pathname:string
+	file:string
+	module:Module
+	constructor(pathname:string,file:string,module:Module){
+		constant(this,'pathname',pathname)
+		constant(this,'file',file)
+		constant(this,'module',module)
+	}
+	execute(request:WebRequest):CommandResult{
+		throw new Error('not override')
+	}
+}
+
+class FileCommand extends Command{
+	buffer:Buffer
+	constructor(pathname:string,file:string,data:Buffer){
+		super(pathname,file,null)
+		constant(this,'buffer',data)
+	}
+	execute(request:WebRequest):CommandResult{
+		return new FileResult(this.file,this.buffer)
+	}
+}
+class ControllerCommand extends Command{
+	methodName:string
+	controllerInfo:ControllerInfo
+	intereptors:any[]
+	constructor(methodName:string,controllerInfo:ControllerInfo){
+		super(path.join(controllerInfo.pathname,methodName),controllerInfo.file,controllerInfo.module)
+		constant(this,'methodName',methodName)
+		constant(this,'controllerInfo',controllerInfo)
+	}
+}
+
+export class CommandResult{}
+
+export class FileResult extends CommandResult{
+	type:string='file'
+	constructor(public filename:string,public data){
+		super()
+	}
+}
+export class JsonResult extends CommandResult{
+	type:string ='json'
+	constructor(public data){
+		super()
+	}
+}
+
+
+export class ContentType{
+	mime:Mime
+	params:{[name:string]:string}
+	constructor(raw:string){
+		let mime :Mime
+		let at = raw.indexOf(' ;')
+		if(at>=0){
+			let mine_t = raw.substring(0,at)
+			mime = Mime.retrive(mine_t)
+			this.mime = mime
+		}else {
+			mime = Mime.retrive(raw)
+			return
+		}
+		let parat = raw.substr(at+2)
+		let paras = parat.split(';')
+		let params =  {}
+		for(let part of paras){
+			const kv = part.split(':')
+			params[kv[0]] = kv[1]
+		}
+		this.params = Object.freeze(params)
+	}
+
+}
+//type/subtype ;parameter
+export class Mime{
+	type:string
+	subtype:string
+	ext:string|string[]
+	constructor(public raw:string){
+		raw = raw.trim()
+		let at = raw.indexOf('/')
+		if(at>=0){
+			this.type = raw.substr(0,at-1)
+		}else return
+		at = raw.indexOf(' ;',at)
+		if(at>=0){
+			this.subtype = raw.substr(this.type.length+1,at-1)
+			at+=2
+		}else {
+			this.subtype = raw.substr(this.type.length+1)
+		}
+		let ct = this.type + '/' + this.subtype
+		if(Mime._cts[ct]) return
+		this.ext = Mime.exts[ct]
+		Mime._cts[ct] = Object.freeze(this)
+		if(this.ext){
+			if((this.ext as any).push){
+				for(let ex of this.ext) Mime._exs[ex]=Object.freeze(this)
+			}else {
+				Mime._exs[this.ext as string]=Object.freeze(this)
+			}
+		}
+	}
+	toString(){return this.raw}
+	static exts:{[ext:string]:string|string[]}
+	private static _cts:{[name:string]:Mime}
+	private static _exs:{[name:string]:Mime}
+	
+	static fromExt(key:string){
+		let ct = Mime._exs[key]
+		if(ct) return ct
+		for(let ct in Mime.exts){
+			let e = Mime.exts[ct]
+			if((e as any).push){
+				for(let en of e) {
+					if(en===key) {
+						new Mime(ct)
+						return Mime._cts[ct]
+					}
+				}
+			}else {
+				if(e==key) {
+					new Mime(ct)
+					return Mime._cts[ct]
+				}
+			}
+		}
+	}
+	static retrive(key:string){
+		let ct = Mime._cts[key]
+		if(!ct) {
+			ct = new Mime(key)
+			return Mime._cts[key]
+		} return ct
+	}
+	static default:Mime
+	static multipart:Mime
+	static formUrlencoded:Mime
+}
+
+
+constant(Mime,'default',Mime.retrive('application/octet-stream'))
+constant(Mime,'multipart',Mime.retrive('multipart/form-data'))
+constant(Mime,'formUrlencoded',Mime.retrive('application/x-www-form-urlencoded'))
+
+Mime.exts ={
+	'application/octet-stream':'',
+	'text/html':['.html','.htm','.xhtml','.htx','.stm','.plg','.jsp'],
+	'text/javascript':['.js'],
+	'application/x-javascript':['.ls','.mocha'],
+	'text/plain':'.txt',
+	'text/xml':['.xml','.dtd','.xslt','.xsd','.svg','.xq','.xql','.xquery','.xsl','.wsdl','.tsd','.dcd','.ent','.mtx','.rdf','.cml','.math','.mml','.fo','.vml','.vxml','xdr'],
+	'image/jpeg':['.jpe','.jpeg','.jfif','.jpg'],
+	'image/png':'.png',
+	'image/bmp':'.bmp',
+	'image/gif':'.gif',
+	'image/x-icon':'.ico',
+	'image/vnd.wap.wbmp':'.wbmp',
+	'image/tiff':['.tif','.tif','.tiff'],
+	'image/vnd.rn-realpix':'.rp',
+	'image/pnetvue':'.net',
+	'image/fax':'.fax',
+
+	'application/msword':['.rtf','.doc','.wiz','.docx','.dot'],
+	'application/pdf':'.pdf',
+	'application/vnd.ms-powerpoint':['.pptx','.pot','.ppt','.ppa','.pwz','.pps'],
+	'application/x-x509-ca-cert':['.der','.cer','crt'],
+	'audio/x-pn-realaudio':['.ram','.rmm'],
+	'video/mpg':['.mpeg','.mpg','.mpv'],
+	'message/rfc822':['.eml','.nws','.mhtml','.mht'],
+'application/x-001':'0.001',
+'text/h323':'0.323',
+'drawing/907':'0.907',
+'audio/x-mei-aac':'.acp',
+'audio/aiff':['.aifc','.aif','.aiff'],
+'text/asa':'.asa',
+'text/asp':'.asp',
+'audio/basic':['.au','.snd'],
+'application/vnd.adobe.workflow':'.awf',
+'application/x-bmp':'.bmp',
+'application/x-c4t':'.c4t',
+'application/x-cals':'.cal',
+'application/x-netcdf':'.cdf',
+'application/x-cel':'.cel',
+'application/x-g4':['.cg4','.g4'],
+'application/x-cit':'.cit',
+'application/x-cmx':'.cmx',
+'application/pkix-crl':'.crl',
+'application/x-csi':'.csi',
+'application/x-cut':'.cut',
+'application/x-dbm':'.dbm',
+'application/x-dib':'.dib',
+'application/x-drw':'.drw',
+'Model/vnd.dwf':'.dwf',
+'application/x-dwg':'.dwg',
+'application/x-dxf':'.dxf',
+'application/x-emf':'.emf',
+'application/x-ps':'.eps',
+'application/x-ebx':'.etd',
+'application/fractals':'.fif',
+'application/x-frm':'.frm',
+'application/x-gbr':'.gbr',
+
+'application/x-gp4':'.gp4',
+'application/x-hmr':'.hmr',
+'application/x-hpl':'.hpl',
+'application/x-hrf':'.hrf',
+'text/x-component':'.htc',
+'application/x-iff':'.iff',
+'application/x-igs':'.igs',
+'application/x-img':'.img',
+'application/x-internet-signup':'.isp',
+
+
+'application/x-laplayer-reg':'.lar',
+'audio/x-liquid-secure':'.lavs',
+'audio/x-la-lms':'.lmsff',
+'application/x-ltr':'.ltr',
+'video/x-mpeg':['.m2v','.m1v','.mps','.mpe'],
+'application/x-troff-man':'.man',
+'application/msaccess':'.mdb',
+'application/x-shockwave-flash':['.mfp','.swf'],
+'audio/mid':['.midi','.mid'],
+'application/x-mil':'.mil',
+'audio/x-musicnet-download':'.mnd',
+'audio/mp1':'.mp1',
+'video/mpeg4':['.mp4','.m4e'],
+'application/vnd.ms-project':['.mpw','.mpd','.mpp','.mpt','.mpx'],
+
+'audio/rn-mpeg':'.mpga',
+
+'application/x-out':'.out',
+'application/x-pkcs12':'.p12',
+'application/pkcs7-mime':'.p7c',
+'application/x-pkcs7-certreqresp':'.p7r',
+'application/x-pc5':'.pc5',
+'application/x-pcl':'.pcl',
+
+'application/vnd.adobe.pdx':'.pdx',
+'application/x-pgl':'.pgl',
+'application/vnd.ms-pki.pko':'.pko',
+'application/x-plt':'.plt',
+'application/x-ppt':'.ppt',
+'application/pics-rules':'.prf',
+'application/x-prt':'.prt',
+
+'audio/vnd.rn-realaudio':'.ra',
+'application/x-ras':'.ras',
+'application/x-red':'.red',
+'application/vnd.rn-realsystem-rjs':'.rjs',
+'application/x-rlc':'.rlc',
+'application/vnd.rn-realmedia':'.rm',
+'':'.rmi',
+
+'application/vnd.rn-realmedia-secure':'.rms',
+'application/vnd.rn-realsystem-rmx':'.rmx',
+
+'application/vnd.rn-rsml':'.rsml',
+
+'video/vnd.rn-realvideo':'.rv',
+'application/x-sat':'.sat',
+'application/x-sdw':'.sdw',
+'application/x-slb':'.slb',
+'drawing/x-slk':'.slk',
+'application/smil':'.smil',
+'application/futuresplash':'.spl',
+'application/streamingmedia':'.ssm',
+'application/vnd.ms-pki.stl':'.stl',
+'application/x-sty':'.sty',
+
+'application/x-tg4':'.tg4',
+
+'drawing/x-top':'.top',
+'application/x-icq':'.uin',
+'text/x-vcard':'.vcf',
+'application/x-vpeg005':'.vpg',
+'application/x-vsd':'.vsd',
+'application/vnd.visio':['.vsx','.vsd','.vss','.vdx','.vst','.vsw','.vtx'],
+'audio/wav':'.wav',
+'application/x-wb1':'.wb1',
+'application/x-wb3':'.wb3',
+'application/x-wk4':'.wk4',
+'application/x-wks':'.wks',
+'audio/x-ms-wma':'.wma',
+'application/x-wmf':'.wmf',
+'video/x-ms-wmv':'.wmv',
+'application/x-ms-wmz':'.wmz',
+'application/x-wpd':'.wpd',
+'application/vnd.ms-wpl':'.wpl',
+'application/x-wr1':'.wr1',
+'application/x-wrk':'.wrk',
+
+'application/vnd.adobe.xdp':'.xdp',
+'application/vnd.adobe.xfd':'.xfd',
+'application/x-xls':'.xls',
+'application/x-xwd':'.xwd',
+'application/vnd.symbian.install':'.sis',
+'application/x-x_t':'.x_t',
+'application/vnd.android.package-archive':'.apk',
+
+'application/x-301':'0.301',
+'application/x-906':'0.906',
+'application/x-a11':'.a11',
+'application/postscript':['.ai','.ps','.eps'],
+
+'application/x-anv':'.anv',
+'video/x-ms-asf':['.asf','.asx'],
+'video/avi':'.avi',
+'application/x-bot':'.bot',
+'application/x-c90':'.c90',
+'application/vnd.ms-pki.seccat':'.cat',
+'application/x-cdr':'.cdr',
+'application/x-cgm':'.cgm',
+'java/*':['.class','.java'],
+'application/x-cmp':'.cmp',
+'application/x-cot':'.cot',
+'text/css':'.css',
+'application/x-dbf':'.dbf',
+'application/x-dbx':'.dbx',
+'application/x-dcx':'.dcx',
+'application/x-dgn':'.dgn',
+
+
+'application/x-dwf':'.dwf',
+'application/x-dxb':'.dxb',
+'application/vnd.adobe.edn':'.edn',
+
+'application/x-epi':'.epi',
+
+'application/x-msdownload':['.exe','.dll'],
+'application/vnd.fdf':'.fdf',
+'application/x-':'.',
+'application/x-gl2':'.gl2',
+'application/x-hgl':'.hgl',
+'application/x-hpgl':'.hpg',
+'application/mac-binhex40':'.hqx',
+'application/hta':'.hta',
+
+'text/webviewhtml':'.htt',
+'application/x-icb':'.icb',
+'application/x-ico':'.ico',
+
+'application/x-iphone':'.iii',
+
+'video/x-ivf':'.IVF',
+
+'application/x-jpe':'.jpe',
+
+'audio/x-liquid-file':'.la1',
+'application/x-latex':'.latex',
+'application/x-lbm':'.lbm',
+
+
+'audio/mpegurl':'.m3u',
+'application/x-mac':'.mac',
+'application/x-mdb':'.mdb',
+
+'application/x-mi':'.mi',
+
+'audio/x-musicnet-stream':'.mns',
+'video/x-sgi-movie':'.movie',
+'audio/mp2':'.mp2',
+'audio/mp3':'.mp3',
+'video/x-mpg':'.mpa',
+'video/mpeg':['.mpv2','.mp2v'],
+'application/x-mmxp':'.mxp',
+'application/x-nrf':'.nrf',
+'text/x-ms-odc':'.odc',
+'application/pkcs10':'.p10',
+'application/x-pkcs7-certificates':'.p7b',
+'application/pkcs7-signature':'.p7s',
+'application/x-pci':'.pci',
+'application/x-pcx':'.pcx',
+'application/x-pic':'.pic',
+'application/x-perl':'.pl',
+'audio/scpls':'.pls',
+
+
+'application/x-ppm':'.ppm',
+
+'application/x-pr':'.pr',
+'application/x-prn':'.prn',
+'application/x-ptn':'.ptn',
+'text/vnd.rn-realtext3d':'.r3t',
+
+'application/rat-file':'.rat',
+'application/vnd.rn-recording':'.rec',
+'application/x-rgb':'.rgb',
+'application/vnd.rn-realsystem-rjt':'.rjt',
+'application/x-rle':'.rle',
+'application/vnd.adobe.rmf':'.rmf',
+'application/vnd.rn-realsystem-rmj':'.rmj',
+'application/vnd.rn-rn_music_package':'.rmp',
+'application/vnd.rn-realmedia-vbr':'.rmvb',
+'application/vnd.rn-realplayer':'.rnx',
+'audio/x-pn-realaudio-plugin':'.rpm',
+'text/vnd.rn-realtext':'.rt',
+'application/x-rtf':'.rtf',
+'application/x-sam':'.sam',
+'application/sdp':'.sdp',
+'application/x-stuffit':'.sit',
+'application/x-sld':'.sld',
+'application/x-smk':'.smk',
+
+
+'application/vnd.ms-pki.certstore':'.sst',
+
+'application/x-tdf':'.tdf',
+'application/x-tga':'.tga',
+'application/x-tif':'.tif',
+'application/x-bittorrent':'.torrent',
+
+'text/iuls':'.uls',
+'application/x-vda':'.vda',
+
+'application/x-vst':'.vst',
+'audio/x-ms-wax':'.wax',
+'application/x-wb2':'.wb2',
+
+'application/x-wk3':'.wk3',
+'application/x-wkq':'.wkq',
+'video/x-ms-wm':'.wm',
+'application/x-ms-wmd':'.wmd',
+'text/vnd.wap.wml':'.wml',
+'video/x-ms-wmx':'.wmx',
+'application/x-wp6':'.wp6',
+'application/x-wpg':'.wpg',
+'application/x-wq1':'.wq1',
+'application/x-wri':'.wri',
+'application/x-ws':['.ws','.ws2'],
+'text/scriptlet':'.wsc',
+'video/x-ms-wvx':'.wvx',
+'application/vnd.adobe.xfdf':'.xfdf',
+'application/vnd.ms-excel':'.xls',
+'application/x-xlw':'.xlw',
+'application/x-x_b':'.x_b',
+'application/vnd.iphone':'.ipa',
+'application/x-silverlight-app':'.xap'
+}
+
+let serv = new WebHost({}).start()
